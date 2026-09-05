@@ -2164,7 +2164,7 @@ struct ENTITY_KEY_tag {
 };
 
 static int
-entity_cmp(const void* p_key, const void* p_entity)
+__cdecl entity_cmp(const void* p_key, const void* p_entity)
 {
     ENTITY_KEY* key = (ENTITY_KEY*) p_key;
     ENTITY* ent = (ENTITY*) p_entity;

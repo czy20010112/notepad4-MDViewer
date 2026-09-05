@@ -1696,7 +1696,7 @@ struct MD_REF_DEF_LIST_tag {
 };
 
 static int
-md_ref_def_cmp(const void* a, const void* b)
+__cdecl md_ref_def_cmp(const void* a, const void* b)
 {
     const MD_REF_DEF* a_ref = *(const MD_REF_DEF**)a;
     const MD_REF_DEF* b_ref = *(const MD_REF_DEF**)b;
@@ -1710,7 +1710,7 @@ md_ref_def_cmp(const void* a, const void* b)
 }
 
 static int
-md_ref_def_cmp_for_sort(const void* a, const void* b)
+__cdecl md_ref_def_cmp_for_sort(const void* a, const void* b)
 {
     int cmp;
 
