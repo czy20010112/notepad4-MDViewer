@@ -42,6 +42,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    defaults:
+      run:
+        shell: bash
     steps:
     - uses: actions/download-artifact@v4
       with:
