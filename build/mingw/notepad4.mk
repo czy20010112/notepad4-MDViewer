@@ -33,13 +33,17 @@ cpp_obj = $(patsubst $(SRCDIR)/%.cpp,$(OBJDIR)/%.obj,$(cpp_src))
 rc_src = $(wildcard $(SRCDIR)/*.rc)
 rc_obj = $(patsubst $(SRCDIR)/%.rc,$(OBJDIR)/%.res,$(rc_src))
 
-all: $(NAME) $(BINFOLDER)/WebView2Loader.dll
+all: $(NAME) $(BINFOLDER)/WebView2Loader.dll $(BINFOLDER)/MDPreviewAssets
 
 $(NAME): $(editlexers_obj) $(cpp_obj) $(md4c_obj) $(rc_obj)
 	$(CXX) $^ $(LDFLAGS) -lscintilla $(LDLIBS) -o $@
 
 $(BINFOLDER)/WebView2Loader.dll: $(SRCDIR)/webview2/x64/WebView2Loader.dll
 	cp -f $< $@
+
+$(BINFOLDER)/MDPreviewAssets: $(NAME)
+	rm -rf $@
+	cp -r $(SRCDIR)/MDPreviewAssets $@
 
 $(editlexers_obj): $(OBJDIR)/%.obj: $(editlexers_dir)/%.cpp
 	$(CXX) -c $(CPPFLAGS) $(CXXFLAGS) $(INCDIR) $< -o $(OBJDIR)/$*.obj
@@ -60,3 +64,4 @@ clean:
 	@$(RM) -rf $(OBJDIR)
 	@$(RM) -f $(NAME)
 	@$(RM) -f $(BINFOLDER)/WebView2Loader.dll
+	@$(RM) -rf $(BINFOLDER)/MDPreviewAssets
