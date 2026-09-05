@@ -38,6 +38,7 @@
 #include "Edit.h"
 #include "Styles.h"
 #include "Dialogs.h"
+#include "MDPreview.h"
 #include "resource.h"
 
 //! show code folding level and state on line number margin
@@ -67,7 +68,7 @@ static HICON hTrayIcon = nullptr;
 static UINT uTrayIconDPI = 0;
 
 #define TOOLBAR_COMMAND_BASE	IDT_FILE_NEW
-#define DefaultToolbarButtons	L"22 3 0 1 27 2 0 4 18 19 0 5 6 0 7 8 9 20 0 10 11 0 12 0 24 0 13 14 0 15 16 0 17"
+#define DefaultToolbarButtons	L"22 3 0 1 27 2 0 4 18 19 0 5 6 0 7 8 9 20 0 10 11 0 12 0 24 0 13 14 0 15 16 0 17 0 28"
 // NOLINTBEGIN(readability-redundant-zero-initializer)
 #if NP2_ENABLE_CUSTOMIZE_TOOLBAR_LABELS
 static TBBUTTON tbbMainWnd[] =
@@ -103,6 +104,7 @@ static const TBBUTTON tbbMainWnd[] =
 	{24, 	IDT_FILE_LAUNCH, 	TBSTATE_ENABLED, TBSTYLE_BUTTON, {0}, 0, 0},
 	{25, 	IDT_VIEW_ALWAYSONTOP, 	TBSTATE_ENABLED, TBSTYLE_BUTTON, {0}, 0, 0},
 	{26, 	IDT_FILE_NEWWINDOW, 	TBSTATE_ENABLED, TBSTYLE_BUTTON, {0}, 0, 0},
+	{27, 	IDT_VIEW_MDPREVIEW, 	TBSTATE_ENABLED, TBSTYLE_BUTTON, {0}, 0, 0},
 };
 // NOLINTEND(readability-redundant-zero-initializer)
 
@@ -198,6 +200,7 @@ static bool bUseInlineIME;
 static int iBidirectional;
 static bool bShowMenu;
 static bool bShowToolbar;
+static bool bMDPreview;				// Markdown preview pane visible
 static int iAutoScaleToolbar;
 static bool bShowStatusbar;
 static bool bInFullScreenMode;
@@ -1130,6 +1133,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT umsg, WPARAM wParam, LPARAM lParam)
 	case WM_DESTROY:
 	case WM_ENDSESSION:
 		if (!bShutdownOK) {
+			MDPreview_Destroy();
 			editMarkAll.Stop();
 			AutoSave_Stop(TRUE);
 			// Terminate file watching
@@ -1853,6 +1857,9 @@ LRESULT MsgCreate(HWND hwnd, WPARAM wParam, LPARAM lParam) noexcept {
 	// Create Toolbar and Statusbar
 	CreateBars(hwnd, hInstance);
 
+	// Create Markdown preview pane (initially hidden)
+	MDPreview_Create(hwnd, hInstance);
+
 	// Window Initialization
 
 	(void)CreateWindowEx(0,
@@ -2133,7 +2140,12 @@ void MsgSize(HWND hwnd, WPARAM wParam, LPARAM lParam) noexcept {
 		cy -= (rc.bottom - rc.top);
 	}
 
-	SetWindowPos(hwndEdit, nullptr, x, y, cx, cy, SWP_NOZORDER | SWP_NOACTIVATE);
+	// the preview pane and the editor share the same client area, only the
+	// visible one is laid out; switching re-runs WM_SIZE so both get fresh bounds
+	HWND hwndContent = bMDPreview ? MDPreview_GetHostWindow() : hwndEdit;
+	if (hwndContent != nullptr) {
+		SetWindowPos(hwndContent, nullptr, x, y, cx, cy, SWP_NOZORDER | SWP_NOACTIVATE);
+	}
 
 	// resize Statusbar items
 	UpdateStatusbar();
@@ -4147,6 +4159,24 @@ LRESULT MsgCommand(HWND hwnd, WPARAM wParam, LPARAM lParam) {
 		UpdateToolbar();
 		break;
 
+	case IDT_VIEW_MDPREVIEW:
+		bMDPreview = !bMDPreview;
+		// the two panes share the same client area; hide the inactive one
+		// (the editor was created first and would otherwise stay on top)
+		ShowWindow(hwndEdit, bMDPreview ? SW_HIDE : SW_SHOW);
+		MDPreview_SetVisible(bMDPreview);
+		if (bMDPreview) {
+			MDPreview_RequestUpdate(false);
+		}
+		// relayout: the editor and the preview pane share the same client area
+		{
+			RECT rc;
+			GetClientRect(hwnd, &rc);
+			SendMessage(hwnd, WM_SIZE, SIZE_RESTORED, MAKELPARAM(rc.right, rc.bottom));
+		}
+		UpdateToolbar();
+		break;
+
 	case IDM_VIEW_MINTOTRAY:
 		bMinimizeToTray = !bMinimizeToTray;
 		break;
@@ -4852,6 +4882,9 @@ LRESULT MsgNotify(HWND hwnd, WPARAM wParam, LPARAM lParam) {
 			++dwCurrentDocReversion;
 			UpdateStatusBarCacheLineColumn();
 			AutoSave_Start(false);
+			if (bMDPreview) {
+				MDPreview_RequestUpdate(true);	// throttled re-render while typing
+			}
 			break;
 
 		case SCN_ZOOM:
@@ -6421,6 +6454,7 @@ void UpdateToolbar() noexcept {
 
 	CheckTool(IDT_VIEW_WORDWRAP, fvCurFile.fWordWrap);
 	CheckTool(IDT_VIEW_ALWAYSONTOP, IsTopMost());
+	CheckTool(IDT_VIEW_MDPREVIEW, bMDPreview);
 }
 
 //=============================================================================
@@ -6970,6 +7004,9 @@ bool FileLoad(FileLoadFlag loadFlag, LPCWSTR lpszFile) {
 		//DisableDelayedStatusBarRedraw(); // already set in MsgSize()
 		UpdateStatusbar();
 		UpdateWindowTitle();
+		if (bMDPreview) {
+			MDPreview_RequestUpdate(false);		// re-render preview for the loaded document
+		}
 		// Show warning: Unicode file loaded as ANSI
 		if (status.bUnicodeErr) {
 			MsgBoxWarn(MB_OK, IDS_ERR_UNICODE);

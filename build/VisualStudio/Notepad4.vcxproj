@@ -157,7 +157,7 @@
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
-      <AdditionalIncludeDirectories>..\..\scintilla\include;..\..\scintilla\lexlib;..\..\scintilla\src;..\..\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>..\..\scintilla\include;..\..\scintilla\lexlib;..\..\scintilla\src;..\..\src;..\..\src\webview2\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>_WINDOWS;NOMINMAX;WIN32_LEAN_AND_MEAN;STRICT_TYPED_ITEMIDS;BOOST_REGEX_STANDALONE;NO_CXX11_REGEX;UNICODE;_UNICODE;_CRT_SECURE_NO_WARNINGS;_SCL_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WarningLevel>Level4</WarningLevel>
       <LanguageStandard>stdcpplatest</LanguageStandard>
@@ -592,8 +592,12 @@
     <ClCompile Include="..\..\src\EditAutoC.cpp" />
     <ClCompile Include="..\..\src\EditEncoding.cpp" />
     <ClCompile Include="..\..\src\Helpers.cpp" />
+    <ClCompile Include="..\..\src\MDPreview.cpp" />
     <ClCompile Include="..\..\src\Notepad4.cpp" />
     <ClCompile Include="..\..\src\Styles.cpp" />
+    <ClCompile Include="..\..\src\md4c\entity.c" />
+    <ClCompile Include="..\..\src\md4c\md4c-html.c" />
+    <ClCompile Include="..\..\src\md4c\md4c.c" />
     <ClCompile Include="..\..\src\EditLexers\stlABAQUS.cpp" />
     <ClCompile Include="..\..\src\EditLexers\stlActionScript.cpp" />
     <ClCompile Include="..\..\src\EditLexers\stlAPDL.cpp" />
@@ -753,6 +757,7 @@
     <ClInclude Include="..\..\src\Dialogs.h" />
     <ClInclude Include="..\..\src\Dlapi.h" />
     <ClInclude Include="..\..\src\Edit.h" />
+    <ClInclude Include="..\..\src\MDPreview.h" />
     <ClInclude Include="..\..\src\EditLexer.h" />
     <ClInclude Include="..\..\src\EditLexers/EditStyle.h" />
     <ClInclude Include="..\..\src\EditLexers/EditStyleX.h" />

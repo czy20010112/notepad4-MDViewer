@@ -31,6 +31,9 @@
     <Filter Include="Scintilla\win32">
       <UniqueIdentifier>{1221a89d-505a-4024-85fe-b060b6c90989}</UniqueIdentifier>
     </Filter>
+    <Filter Include="md4c">
+      <UniqueIdentifier>{8f4c41d0-6a2b-4e0e-9d3a-1c5b7a9e2f10}</UniqueIdentifier>
+    </Filter>
     <Filter Include="Source Files\EditLexers">
       <UniqueIdentifier>{b1934aa4-ee5f-4fb6-a9f8-2b410b6611eb}</UniqueIdentifier>
     </Filter>
@@ -422,6 +425,18 @@
     </ClCompile>
     <ClCompile Include="..\..\src\Edit.cpp">
       <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\MDPreview.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\md4c\entity.c">
+      <Filter>md4c</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\md4c\md4c-html.c">
+      <Filter>md4c</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\md4c\md4c.c">
+      <Filter>md4c</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\EditAutoC.cpp">
       <Filter>Source Files</Filter>
@@ -909,6 +924,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\..\src\Edit.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\MDPreview.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\..\src\EditLexer.h">
