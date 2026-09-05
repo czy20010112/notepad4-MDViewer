@@ -133,6 +133,10 @@ EXIT /B
 
 :SubZipFiles
 IF NOT EXIST "%1\Notepad4.exe" CALL (:SUBMSG "ERROR" "%1\Notepad4.exe NOT found" & EXIT /B)
+@rem WebView2 loader architecture: AVX2/AVX512 builds use the x64 loader
+SET "LOADER_ARCH=%2"
+IF /I "%2" == "AVX2"   SET "LOADER_ARCH=x64"
+IF /I "%2" == "AVX512" SET "LOADER_ARCH=x64"
 IF NOT EXIST "%1\matepath.exe" CALL (:SUBMSG "ERROR" "%1\matepath.exe NOT found" & EXIT /B)
 
 IF "%ZIP_SUFFIX%" == "" (SET "ZIP_NAME=Notepad4") ELSE (SET "ZIP_NAME=Notepad4_%ZIP_SUFFIX%")
@@ -151,6 +155,8 @@ IF NOT EXIST "%TEMP_ZIP_DIR%" MD "%TEMP_ZIP_DIR%"
 FOR %%A IN ( "..\License.txt"  "%1\Notepad4.exe"  "%1\matepath.exe" "..\doc\Notepad4.ini" "..\matepath\doc\matepath.ini"
 ) DO COPY /Y /B /V "%%A" "%TEMP_ZIP_DIR%\"
 COPY /Y /B /V "..\doc\Notepad4 DarkTheme.ini" "%TEMP_ZIP_DIR%\"
+COPY /Y /B /V "..\src\webview2\%LOADER_ARCH%\WebView2Loader.dll" "%TEMP_ZIP_DIR%\"
+XCOPY /Q /S /Y /I "..\src\MDPreviewAssets" "%TEMP_ZIP_DIR%\MDPreviewAssets\"
 IF "%WITH_LOCALE%" == "1" (
   XCOPY /Q /S /Y "%1\locale" "%TEMP_ZIP_DIR%\locale\"
 )
