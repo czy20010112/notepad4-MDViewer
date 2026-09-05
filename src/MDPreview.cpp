@@ -15,19 +15,26 @@
 
 #include <windows.h>
 #include <windowsx.h>
+#include <commctrl.h>
 #include <shlwapi.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <commdlg.h>
 
+#include <algorithm>
+#include <cstdio>
 #include <string>
+#include <vector>
 
 #include "WebView2.h"
 #include "md4c/md4c-html.h"
 
 #include "SciCall.h"
 #include "Helpers.h"
+#include "Dialogs.h"
 #include "Notepad4.h"
 #include "MDPreview.h"
+#include "resource.h"
 
 extern HWND hwndMain;
 
@@ -38,6 +45,7 @@ constexpr WCHAR kVirtualHost[] = L"mdpreview.local";
 constexpr int kUpdateTimerId = 0x4D44;	// 'MD'
 constexpr UINT kUpdateDelayMs = 350;
 constexpr size_t kMaxSourceBytes = 1 * 1024 * 1024;	// keep rendered HTML below NavigateToString limit
+constexpr size_t kMaxNavigateToStringChars = 1500000;	// NavigateToString() hard limit is 2 MB
 
 HWND s_hwndHost = nullptr;
 bool s_visible = false;
@@ -46,7 +54,22 @@ bool s_pageAlive = false;		// a document is loaded in the webview
 bool s_renderBusy = false;		// scroll capture/navigation chain in flight
 bool s_dirty = false;			// content changed while a render is in flight
 bool s_ownNavExpected = false;	// next NavigationStarting event is our own navigation
+bool s_printOnNavComplete = false;	// export PDF once the fresh render finished
+std::wstring s_pdfTargetPath;	// output path of the pending PDF export
 LONG s_lastScrollY = 0;
+
+MDPreviewConfig s_config;
+
+void MDPreviewConfig_SetDefaults(MDPreviewConfig &cfg) noexcept {
+	cfg.bodyFont[0] = L'\0';
+	cfg.bodySize = 16;
+	cfg.headingFont[0] = L'\0';
+	cfg.headingScale = 100;
+	cfg.codeFont[0] = L'\0';
+	cfg.codeScale = 88;
+	cfg.tableHeadBg = RGB(0xF9, 0xF6, 0xF0);
+	cfg.tableBorder = RGB(0xD7, 0xC4, 0xB2);
+}
 
 ICoreWebView2Environment *s_env = nullptr;
 ICoreWebView2Controller *s_controller = nullptr;
@@ -67,6 +90,10 @@ constexpr IID kIID_ICoreWebView2NavigationStartingEventHandler = {0x9adbe429, 0x
 constexpr IID kIID_ICoreWebView2NavigationCompletedEventHandler = {0xd33a35bf, 0x1c49, 0x4f98, {0x93,0xab,0x00,0x6e,0x05,0x33,0xfe,0x1c}};
 constexpr IID kIID_ICoreWebView2ExecuteScriptCompletedHandler = {0x49511172, 0xcc67, 0x4bca, {0x99,0x23,0x13,0x71,0x12,0xf4,0xc4,0xcc}};
 constexpr IID kIID_ICoreWebView2_3 = {0xA0D6DF20, 0x3B92, 0x416D, {0xAA,0x0C,0x43,0x7A,0x9C,0x72,0x78,0x57}};
+constexpr IID kIID_ICoreWebView2_7 = {0x79c24d83, 0x09a3, 0x45ae, {0x94,0x18,0x48,0x7f,0x32,0xa5,0x87,0x40}};
+constexpr IID kIID_ICoreWebView2Environment6 = {0xe59ee362, 0xacbd, 0x4857, {0x9a,0x8e,0xd3,0x64,0x4d,0x94,0x59,0xa9}};
+constexpr IID kIID_ICoreWebView2PrintSettings = {0x377f3721, 0xc74e, 0x48ca, {0x8d,0xb1,0xdf,0x68,0xe5,0x1d,0x60,0xe2}};
+constexpr IID kIID_ICoreWebView2PrintToPdfCompletedHandler = {0xccf1ef04, 0xfd8e, 0x4d5f, {0xb2,0xde,0x09,0x83,0xe4,0x1b,0x8c,0x36}};
 
 template <class Itf, const IID *piid>
 class ComHandlerBase : public Itf {
@@ -122,6 +149,13 @@ public:
 	HRESULT STDMETHODCALLTYPE Invoke(HRESULT errorCode, LPCWSTR resultObjectAsJson) override;
 };
 
+class PrintToPdfHandler final : public ComHandlerBase<ICoreWebView2PrintToPdfCompletedHandler, &kIID_ICoreWebView2PrintToPdfCompletedHandler> {
+public:
+	HRESULT STDMETHODCALLTYPE Invoke(HRESULT errorCode, BOOL isSuccessful) override;
+};
+
+void DoPrintToPdf();
+
 //=============================================================================
 // Document text access and markdown rendering.
 
@@ -131,7 +165,7 @@ std::string GetDocumentText() {
 		return std::string();
 	}
 	std::string text(static_cast<size_t>(length) + 1, '\0');
-	SciCall_GetText(length + 1, text.data());
+	SciCall_GetText(length, text.data());
 	text.resize(static_cast<size_t>(length));
 	return text;
 }
@@ -164,50 +198,97 @@ std::wstring Utf8ToWide(const std::string &text) {
 
 // mdviewer.net (warm paper theme) inspired style: Inter/system body, JetBrains
 // Mono code, serif headings, collapse tables with generous cell padding.
-const char kPreviewStyle[] = R"CSS(
-:root{--bg:#fcfbf8;--text:#2c2421;--text-secondary:#5c544f;--text-muted:#8c847f;
---border-subtle:#eae0d5;--border-medium:#d7c4b2;--border-strong:#cdb8a3;
---thead-bg:#f9f6f0;--code-bg:#f0e5d8;--pre-bg:#2c2421;--pre-color:#f5f1e6;
---link:#1f6f9c;--inline-code-color:#9c4221;
---font-body:"Inter","Segoe UI",system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
---font-mono:"JetBrains Mono","Cascadia Mono","Consolas","Microsoft YaHei",monospace;
---font-heading:"Playfair Display","Georgia","Times New Roman",serif}
-html,body{background:var(--bg)}
-body{font-family:var(--font-body);color:var(--text);font-size:16px;line-height:1.75;
-margin:0 auto;padding:36px 52px 72px;max-width:920px;-webkit-font-smoothing:antialiased;
-overflow-wrap:break-word}
-h1,h2,h3,h4,h5,h6{font-family:var(--font-heading);font-weight:700;color:#241b18;line-height:1.35;margin:1.5em 0 .55em}
-h1{font-size:2.05em;margin-top:.35em;border-bottom:1px solid var(--border-subtle);padding-bottom:.32em}
-h2{font-size:1.6em}h3{font-size:1.3em}h4{font-size:1.12em}h5{font-size:1em}h6{font-size:.95em;color:var(--text-secondary)}
-p,ul,ol,pre,blockquote,table,hr{margin:1em 0}
-li{margin:.25em 0}
-ul ul,ol ol,ul ol,ol ul{margin:.1em 0}
-a{color:var(--link);text-decoration:none}
-a:hover{text-decoration:underline}
-table{border-collapse:collapse;width:100%;font-size:.95em}
-th,td{border:1px solid var(--border-medium);padding:10px 12px;text-align:left;vertical-align:top}
-thead th{background:var(--thead-bg);color:#241b18;font-weight:700;position:sticky;top:0;z-index:1}
-tbody tr:nth-child(2n){background:#f9f6f055}
-pre{background:var(--pre-bg);color:var(--pre-color);border-radius:8px;padding:16px;overflow-x:auto;line-height:1.6}
-code{font-family:var(--font-mono);font-size:.88em}
-:not(pre)>code{background:var(--code-bg);color:var(--inline-code-color);border-radius:6px;padding:.16em .42em}
-pre>code{background:none;color:inherit;padding:0;font-size:1em}
-blockquote{border-left:3px solid var(--border-strong);background:#f9f6f0aa;color:var(--text-secondary);
-padding:6px 18px;border-radius:0 8px 8px 0}
-blockquote p{margin:.4em 0}
-img{max-width:100%;height:auto;border-radius:4px}
-hr{border:0;border-top:1px solid var(--border-subtle);margin:1.6em 0}
-input[type=checkbox]{margin-right:.45em;accent-color:#a8804f}
-mark{background:#f5dfa8;border-radius:3px;padding:0 .15em}
-del,s{color:var(--text-muted)}
-kbd{font-family:var(--font-mono);font-size:.82em;background:var(--thead-bg);border:1px solid var(--border-medium);
-border-bottom-width:2px;border-radius:5px;padding:.1em .45em}
-::selection{background:#ecd9c0}
-::-webkit-scrollbar{width:10px;height:10px}
-::-webkit-scrollbar-thumb{background:#8c847f6b;border-radius:5px}
-::-webkit-scrollbar-thumb:hover{background:#5c544f85}
-::-webkit-scrollbar-track{background:transparent}
-)CSS";
+// All CSS here is original; only color values and font stacks reference the site.
+// Fonts, sizes and table colors come from the user settings.
+
+void FormatHexColor(COLORREF color, WCHAR (&text)[8]) {
+	wsprintf(text, L"#%02X%02X%02X", GetRValue(color), GetGValue(color), GetBValue(color));
+}
+
+std::string ColorToCss(COLORREF color) {
+	char buf[16];
+	snprintf(buf, sizeof(buf), "#%02X%02X%02X", GetRValue(color), GetGValue(color), GetBValue(color));
+	return std::string(buf);
+}
+
+// font-family list: user chosen family first (may be empty), then fallbacks.
+std::string FontStack(const WCHAR *userFont, const char *fallbacks) {
+	std::string stack;
+	if (userFont[0] != L'\0') {
+		// convert the family name to UTF-8 and quote it
+		const int cch = ::WideCharToMultiByte(CP_UTF8, 0, userFont, -1, nullptr, 0, nullptr, nullptr);
+		std::string utf8(static_cast<size_t>(cch > 0 ? cch - 1 : 0), '\0');
+		if (!utf8.empty()) {
+			::WideCharToMultiByte(CP_UTF8, 0, userFont, -1, utf8.data(), cch, nullptr, nullptr);
+		}
+		stack += '\'';
+		stack += utf8;
+		stack += '\'';
+		stack += ',';
+	}
+	stack += fallbacks;
+	return stack;
+}
+
+std::string BuildPreviewStyle() {
+	char buf[512];
+	std::string css;
+	const std::string headBg = ColorToCss(s_config.tableHeadBg);
+	const std::string border = ColorToCss(s_config.tableBorder);
+
+	css += ":root{--bg:#fcfbf8;--text:#2c2421;--text-secondary:#5c544f;--text-muted:#8c847f;";
+	css += "--thead-bg:" + headBg + ";--border-medium:" + border + ";";
+	css += "--border-subtle:#eae0d5;--border-strong:#cdb8a3;--code-bg:#f0e5d8;--pre-bg:#2c2421;--pre-color:#f5f1e6;";
+	css += "--link:#1f6f9c;--inline-code-color:#9c4221;}";
+
+	css += "html,body{background:var(--bg)}";
+	css += "body{font-family:" + FontStack(s_config.bodyFont,
+		"\"Inter\",\"Segoe UI\",system-ui,-apple-system,\"PingFang SC\",\"Microsoft YaHei\",sans-serif") + ";";
+	css += "color:var(--text);";
+	snprintf(buf, sizeof(buf), "font-size:%dpx;line-height:1.75;", s_config.bodySize);
+	css += buf;
+	css += "margin:0 auto;padding:36px 52px 72px;max-width:920px;-webkit-font-smoothing:antialiased;overflow-wrap:break-word}";
+
+	const double scale = s_config.headingScale / 100.0;
+	css += "h1,h2,h3,h4,h5,h6{font-family:" + FontStack(s_config.headingFont,
+		"\"Playfair Display\",\"Georgia\",\"Times New Roman\",serif") + ";";
+	css += "font-weight:700;color:#241b18;line-height:1.35;margin:1.5em 0 .55em}";
+	snprintf(buf, sizeof(buf), "h1{font-size:%.2fem;margin-top:.35em;border-bottom:1px solid var(--border-subtle);padding-bottom:.32em}", 2.05 * scale);
+	css += buf;
+	snprintf(buf, sizeof(buf), "h2{font-size:%.2fem}h3{font-size:%.2fem}h4{font-size:%.2fem}h5{font-size:%.2fem}h6{font-size:%.2fem;color:var(--text-secondary)}",
+			 1.60 * scale, 1.30 * scale, 1.12 * scale, 1.00 * scale, 0.95 * scale);
+	css += buf;
+
+	css += "p,ul,ol,pre,blockquote,table,hr{margin:1em 0}li{margin:.25em 0}ul ul,ol ol,ul ol,ol ul{margin:.1em 0}";
+	css += "a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}";
+	css += "table{border-collapse:collapse;width:100%;font-size:.95em}";
+	css += "th,td{border:1px solid var(--border-medium);padding:10px 12px;text-align:left;vertical-align:top}";
+	css += "thead th{background:var(--thead-bg);color:#241b18;font-weight:700;position:sticky;top:0;z-index:1}";
+	css += "tbody tr:nth-child(2n){background:" + headBg + "55}";
+	css += "pre{background:var(--pre-bg);color:var(--pre-color);border-radius:8px;padding:16px;overflow-x:auto;line-height:1.6}";
+	css += "code{font-family:" + FontStack(s_config.codeFont,
+		"\"JetBrains Mono\",\"Cascadia Mono\",\"Consolas\",\"Microsoft YaHei\",monospace") + ";";
+	snprintf(buf, sizeof(buf), "font-size:%d%%}", s_config.codeScale);
+	css += buf;
+	css += ":not(pre)>code{background:var(--code-bg);color:var(--inline-code-color);border-radius:6px;padding:.16em .42em}";
+	css += "pre>code{background:none;color:inherit;padding:0;font-size:1em}";
+	css += "blockquote{border-left:3px solid var(--border-strong);background:" + headBg + "aa;color:var(--text-secondary);padding:6px 18px;border-radius:0 8px 8px 0}";
+	css += "blockquote p{margin:.4em 0}";
+	css += "img{max-width:100%;height:auto;border-radius:4px}";
+	css += "hr{border:0;border-top:1px solid var(--border-subtle);margin:1.6em 0}";
+	css += "input[type=checkbox]{margin-right:.45em;accent-color:#a8804f}";
+	css += "mark{background:#f5dfa8;border-radius:3px;padding:0 .15em}";
+	css += "del,s{color:var(--text-muted)}";
+	css += "kbd{font-family:" + FontStack(s_config.codeFont,
+		"\"JetBrains Mono\",\"Cascadia Mono\",\"Consolas\",\"Microsoft YaHei\",monospace") + ";font-size:.82em;background:var(--thead-bg);border:1px solid var(--border-medium);border-bottom-width:2px;border-radius:5px;padding:.1em .45em}";
+	css += "::selection{background:#ecd9c0}";
+	css += "::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-thumb{background:#8c847f6b;border-radius:5px}";
+	css += "::-webkit-scrollbar-thumb:hover{background:#5c544f85}::-webkit-scrollbar-track{background:transparent}";
+	// print (PDF export): fixed A4 friendly layout, avoid splitting blocks
+	css += "@media print{body{padding:0;max-width:none}thead th{position:static}";
+	css += "pre,blockquote,tr,img{break-inside:avoid}h1,h2,h3,h4,h5,h6{break-after:avoid}a{color:inherit}}";
+	return css;
+}
 
 void BuildHtml(const std::string &bodyHtml, LONG scrollY, std::wstring &html) {
 	WCHAR title[MAX_PATH];
@@ -238,7 +319,7 @@ void BuildHtml(const std::string &bodyHtml, LONG scrollY, std::wstring &html) {
 	html += L"<title>";
 	html += title;
 	html += L"</title><style>\n";
-	html += Utf8ToWide(kPreviewStyle);
+	html += Utf8ToWide(BuildPreviewStyle());
 	html += L"\n</style></head><body>\n";
 	html += Utf8ToWide(bodyHtml);
 	html += L"\n<script>try{window.scrollTo(0,";
@@ -254,6 +335,17 @@ void NavigateToDocumentHtml(const std::wstring &html) {
 	}
 	s_ownNavExpected = true;
 	s_pageAlive = false;
+	if (html.size() > kMaxNavigateToStringChars) {
+		// NavigateToString() accepts at most 2 MB
+		HRESULT hr = s_webview->NavigateToString(
+			L"<!DOCTYPE html><html><body style=\"font-family:sans-serif;color:#5c544f;padding:40px\">"
+			L"<p>Rendered document exceeds the 2 MB limit of the preview.</p></body></html>");
+		if (SUCCEEDED(hr)) {
+			return;
+		}
+		s_ownNavExpected = false;
+		return;
+	}
 	HRESULT hr = s_webview->NavigateToString(html.c_str());
 	if (FAILED(hr)) {
 		s_ownNavExpected = false;
@@ -414,6 +506,11 @@ HRESULT STDMETHODCALLTYPE NavigationCompletedHandler::Invoke(ICoreWebView2 *send
 		s_dirty = false;
 		s_renderBusy = true;
 		s_webview->ExecuteScript(L"window.scrollY|0", new ScrollCaptureHandler());
+		return S_OK;
+	}
+	if (s_printOnNavComplete) {
+		s_printOnNavComplete = false;
+		DoPrintToPdf();
 	}
 	return S_OK;
 }
@@ -459,6 +556,344 @@ LRESULT CALLBACK MDPreviewHostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 }
 
 } // namespace
+
+//=============================================================================
+// Markdown preview settings (INI persistence).
+//
+
+bool ParseHexColor(LPCWSTR text, COLORREF &color) {
+	while (*text == L' ' || *text == L'#') {
+		text++;
+	}
+	if (::StrCmpNIW(text, L"0x", 2) == 0) {
+		text += 2;
+	}
+	WCHAR *end = nullptr;
+	const unsigned long value = ::wcstoul(text, &end, 16);
+	if (end == text || *end != L'\0' || value > 0xFFFFFF) {
+		return false;
+	}
+	color = RGB((value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF);
+	return true;
+}
+
+void MDPreview_LoadSettings() noexcept {
+	MDPreviewConfig_SetDefaults(s_config);
+	WCHAR tch[LF_FACESIZE];
+	::IniGetString(INI_SECTION_NAME_MD_PREVIEW, L"BodyFont", L"", tch, COUNTOF(tch));
+	if (StrNotEmpty(tch)) {
+		::StrCpyNW(s_config.bodyFont, tch, LF_FACESIZE);
+	}
+	s_config.bodySize = ::IniGetInt(INI_SECTION_NAME_MD_PREVIEW, L"BodyFontSize", 16);
+	::IniGetString(INI_SECTION_NAME_MD_PREVIEW, L"HeadingFont", L"", tch, COUNTOF(tch));
+	if (StrNotEmpty(tch)) {
+		::StrCpyNW(s_config.headingFont, tch, LF_FACESIZE);
+	}
+	s_config.headingScale = ::IniGetInt(INI_SECTION_NAME_MD_PREVIEW, L"HeadingScale", 100);
+	::IniGetString(INI_SECTION_NAME_MD_PREVIEW, L"CodeFont", L"", tch, COUNTOF(tch));
+	if (StrNotEmpty(tch)) {
+		::StrCpyNW(s_config.codeFont, tch, LF_FACESIZE);
+	}
+	s_config.codeScale = ::IniGetInt(INI_SECTION_NAME_MD_PREVIEW, L"CodeScale", 88);
+
+	::IniGetString(INI_SECTION_NAME_MD_PREVIEW, L"TableHeadBg", L"#F9F6F0", tch, COUNTOF(tch));
+	ParseHexColor(tch, s_config.tableHeadBg);
+	::IniGetString(INI_SECTION_NAME_MD_PREVIEW, L"TableBorder", L"#D7C4B2", tch, COUNTOF(tch));
+	ParseHexColor(tch, s_config.tableBorder);
+
+	s_config.bodySize = std::clamp(s_config.bodySize, 9, 40);
+	s_config.headingScale = std::clamp(s_config.headingScale, 50, 300);
+	s_config.codeScale = std::clamp(s_config.codeScale, 40, 200);
+}
+
+void MDPreview_SaveSettings() noexcept {
+	WCHAR tch[16];
+	::IniSetString(INI_SECTION_NAME_MD_PREVIEW, L"BodyFont", s_config.bodyFont);
+	wsprintf(tch, L"%d", s_config.bodySize);
+	::IniSetString(INI_SECTION_NAME_MD_PREVIEW, L"BodyFontSize", tch);
+	::IniSetString(INI_SECTION_NAME_MD_PREVIEW, L"HeadingFont", s_config.headingFont);
+	wsprintf(tch, L"%d", s_config.headingScale);
+	::IniSetString(INI_SECTION_NAME_MD_PREVIEW, L"HeadingScale", tch);
+	::IniSetString(INI_SECTION_NAME_MD_PREVIEW, L"CodeFont", s_config.codeFont);
+	wsprintf(tch, L"%d", s_config.codeScale);
+	::IniSetString(INI_SECTION_NAME_MD_PREVIEW, L"CodeScale", tch);
+	WCHAR szColor[8];
+	FormatHexColor(s_config.tableHeadBg, szColor);
+	::IniSetString(INI_SECTION_NAME_MD_PREVIEW, L"TableHeadBg", szColor);
+	FormatHexColor(s_config.tableBorder, szColor);
+	::IniSetString(INI_SECTION_NAME_MD_PREVIEW, L"TableBorder", szColor);
+}
+
+namespace {
+
+//=============================================================================
+// Markdown preview settings dialog.
+//
+
+void FillFontCombo(HWND hwndCombo, LPCWSTR current) {
+	std::vector<std::wstring> names;
+	HDC hdc = ::GetDC(hwndCombo);
+	LOGFONTW lf;
+	ZeroMemory(&lf, sizeof(lf));
+	lf.lfCharSet = DEFAULT_CHARSET;
+	::EnumFontFamiliesExW(hdc, &lf, [](const LOGFONTW *plf, const TEXTMETRICW *, DWORD, LPARAM lParam) -> int {
+		auto list = reinterpret_cast<std::vector<std::wstring> *>(lParam);
+		if (plf->lfFaceName[0] != L'@') {
+			list->emplace_back(plf->lfFaceName);
+		}
+		return 1;
+	}, reinterpret_cast<LPARAM>(&names), 0);
+	::ReleaseDC(hwndCombo, hdc);
+
+	std::sort(names.begin(), names.end());
+	names.erase(std::unique(names.begin(), names.end()), names.end());
+	::SendMessage(hwndCombo, CB_RESETCONTENT, 0, 0);
+	bool found = false;
+	for (const std::wstring &name : names) {
+		const LPARAM index = ::SendMessageW(hwndCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(name.c_str()));
+		if (!found && current[0] != L'\0' && ::StrCmpIW(name.c_str(), current) == 0) {
+			::SendMessageW(hwndCombo, CB_SETCURSEL, index, 0);
+			found = true;
+		}
+	}
+	if (current[0] != L'\0') {
+		// keep unknown font names selectable (font may not be installed yet)
+		if (!found) {
+			const LPARAM index = ::SendMessageW(hwndCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(current));
+			::SendMessageW(hwndCombo, CB_SETCURSEL, index, 0);
+		}
+	} else {
+		::SendMessageW(hwndCombo, CB_SETCURSEL, -1, 0);
+	}
+}
+
+void GetFontComboText(HWND hwndCombo, WCHAR (&text)[LF_FACESIZE]) {
+	const int index = static_cast<int>(::SendMessageW(hwndCombo, CB_GETCURSEL, 0, 0));
+	if (index >= 0) {
+		const int len = static_cast<int>(::SendMessageW(hwndCombo, CB_GETLBTEXTLEN, index, 0));
+		if (len > 0 && len < LF_FACESIZE) {
+			::SendMessageW(hwndCombo, CB_GETLBTEXT, index, reinterpret_cast<LPARAM>(text));
+			return;
+		}
+	}
+	::GetWindowTextW(hwndCombo, text, LF_FACESIZE);
+}
+
+bool PickColor(HWND hwnd, COLORREF &color) {
+	static COLORREF custColors[16] = {};
+	CHOOSECOLORW cc;
+	ZeroMemory(&cc, sizeof(cc));
+	cc.lStructSize = sizeof(cc);
+	cc.hwndOwner = hwnd;
+	cc.rgbResult = color;
+	cc.lpCustColors = custColors;
+	cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+	if (!::ChooseColorW(&cc)) {
+		return false;
+	}
+	color = cc.rgbResult;
+	return true;
+}
+
+void ReadDialogValues(HWND hwnd) noexcept {
+	GetFontComboText(::GetDlgItem(hwnd, IDC_MDPREVIEW_BODYFONT), s_config.bodyFont);
+	GetFontComboText(::GetDlgItem(hwnd, IDC_MDPREVIEW_HEADFONT), s_config.headingFont);
+	GetFontComboText(::GetDlgItem(hwnd, IDC_MDPREVIEW_CODEFONT), s_config.codeFont);
+	s_config.bodySize = std::clamp(static_cast<int>(::GetDlgItemInt(hwnd, IDC_MDPREVIEW_BODYSIZE, nullptr, FALSE)), 9, 40);
+	s_config.headingScale = std::clamp(static_cast<int>(::GetDlgItemInt(hwnd, IDC_MDPREVIEW_HEADSCALE, nullptr, FALSE)), 50, 300);
+	s_config.codeScale = std::clamp(static_cast<int>(::GetDlgItemInt(hwnd, IDC_MDPREVIEW_CODESCALE, nullptr, FALSE)), 40, 200);
+	WCHAR tch[64];
+	::GetDlgItemTextW(hwnd, IDC_MDPREVIEW_HEADBG, tch, COUNTOF(tch));
+	if (!ParseHexColor(tch, s_config.tableHeadBg)) {
+		s_config.tableHeadBg = RGB(0xF9, 0xF6, 0xF0);
+	}
+	::GetDlgItemTextW(hwnd, IDC_MDPREVIEW_BORDER, tch, COUNTOF(tch));
+	if (!ParseHexColor(tch, s_config.tableBorder)) {
+		s_config.tableBorder = RGB(0xD7, 0xC4, 0xB2);
+	}
+}
+
+void WriteDialogValues(HWND hwnd, const MDPreviewConfig &cfg) {
+	::SetDlgItemTextW(hwnd, IDC_MDPREVIEW_BODYFONT, cfg.bodyFont);
+	::SetDlgItemInt(hwnd, IDC_MDPREVIEW_BODYSIZE, static_cast<UINT>(cfg.bodySize), FALSE);
+	::SetDlgItemTextW(hwnd, IDC_MDPREVIEW_HEADFONT, cfg.headingFont);
+	::SetDlgItemInt(hwnd, IDC_MDPREVIEW_HEADSCALE, static_cast<UINT>(cfg.headingScale), FALSE);
+	::SetDlgItemTextW(hwnd, IDC_MDPREVIEW_CODEFONT, cfg.codeFont);
+	::SetDlgItemInt(hwnd, IDC_MDPREVIEW_CODESCALE, static_cast<UINT>(cfg.codeScale), FALSE);
+	WCHAR tch[8];
+	FormatHexColor(cfg.tableHeadBg, tch);
+	::SetDlgItemTextW(hwnd, IDC_MDPREVIEW_HEADBG, tch);
+	FormatHexColor(cfg.tableBorder, tch);
+	::SetDlgItemTextW(hwnd, IDC_MDPREVIEW_BORDER, tch);
+}
+
+INT_PTR CALLBACK MDPreviewSettingsDlgProc(HWND hwnd, UINT umsg, WPARAM wParam, LPARAM lParam) noexcept {
+	switch (umsg) {
+	case WM_INITDIALOG:
+		WriteDialogValues(hwnd, s_config);
+		::SendDlgItemMessageW(hwnd, IDC_MDPREVIEW_BODYSIZE_SPIN, UDM_SETRANGE32, 9, 40);
+		::SendDlgItemMessageW(hwnd, IDC_MDPREVIEW_HEADSCALE_SPIN, UDM_SETRANGE32, 50, 300);
+		::SendDlgItemMessageW(hwnd, IDC_MDPREVIEW_CODESCALE_SPIN, UDM_SETRANGE32, 40, 200);
+		CenterDlgInParent(hwnd);
+		return TRUE;
+
+	case WM_COMMAND:
+		switch (LOWORD(wParam)) {
+		case IDOK:
+			ReadDialogValues(hwnd);
+			::EndDialog(hwnd, IDOK);
+			break;
+		case IDCANCEL:
+			::EndDialog(hwnd, IDCANCEL);
+			break;
+		case IDC_MDPREVIEW_RESTORE: {
+			MDPreviewConfig defaults;
+			MDPreviewConfig_SetDefaults(defaults);
+			WriteDialogValues(hwnd, defaults);
+		} break;
+		case IDC_MDPREVIEW_HEADBG_BTN:
+		case IDC_MDPREVIEW_BORDER_BTN: {
+			const int editId = (LOWORD(wParam) == IDC_MDPREVIEW_HEADBG_BTN) ? IDC_MDPREVIEW_HEADBG : IDC_MDPREVIEW_BORDER;
+			WCHAR tch[64];
+			WCHAR szHex[8];
+			COLORREF color;
+			::GetDlgItemTextW(hwnd, editId, tch, COUNTOF(tch));
+			if (!ParseHexColor(tch, color)) {
+				color = (editId == IDC_MDPREVIEW_HEADBG) ? s_config.tableHeadBg : s_config.tableBorder;
+			}
+			if (PickColor(hwnd, color)) {
+				FormatHexColor(color, szHex);
+				::SetDlgItemTextW(hwnd, editId, szHex);
+			}
+		} break;
+		}
+		return TRUE;
+	}
+	return FALSE;
+}
+
+} // namespace
+
+void MDPreview_SettingsDialog(HWND hwnd) noexcept {
+	if (ThemedDialogBoxParam(g_hInstance, MAKEINTRESOURCEW(IDD_MDPREVIEW_SETTINGS), hwnd,
+							 MDPreviewSettingsDlgProc, 0) == IDOK) {
+		MDPreview_SaveSettings();
+		MDPreview_RequestUpdate(false);		// apply immediately when the preview is visible
+	}
+}
+
+//=============================================================================
+// PDF export (WebView2 PrintToPdf, fixed A4 portrait layout).
+//
+
+namespace {
+
+HRESULT STDMETHODCALLTYPE PrintToPdfHandler::Invoke(HRESULT errorCode, BOOL isSuccessful) {
+	if (SUCCEEDED(errorCode) && isSuccessful) {
+		MsgBoxInfo(MB_OK, IDS_MDPREVIEW_PDF_SAVED);
+	} else {
+		MsgBoxWarn(MB_OK, IDS_MDPREVIEW_PDF_FAILED);
+	}
+	return S_OK;
+}
+
+void DoPrintToPdf() {
+	std::wstring path;
+	path.swap(s_pdfTargetPath);
+	if (!s_webview || path.empty()) {
+		return;
+	}
+
+	ICoreWebView2PrintSettings *print = nullptr;
+	ICoreWebView2Environment6 *env6 = nullptr;
+	if (s_env && SUCCEEDED(s_env->QueryInterface(kIID_ICoreWebView2Environment6, reinterpret_cast<void **>(&env6))) &&
+		env6 != nullptr) {
+		env6->CreatePrintSettings(&print);
+		env6->Release();
+	}
+	if (print == nullptr) {
+		MsgBoxWarn(MB_OK, IDS_MDPREVIEW_PDF_FAILED);
+		return;
+	}
+
+	print->put_Orientation(COREWEBVIEW2_PRINT_ORIENTATION_PORTRAIT);
+	print->put_ScaleFactor(1.0);
+	print->put_PageWidth(8.27);		// A4 portrait, inches
+	print->put_PageHeight(11.69);
+	print->put_MarginTop(0.4);
+	print->put_MarginBottom(0.4);
+	print->put_MarginLeft(0.4);
+	print->put_MarginRight(0.4);
+	print->put_ShouldPrintBackgrounds(TRUE);
+	print->put_ShouldPrintHeaderAndFooter(FALSE);
+
+	ICoreWebView2_7 *webview7 = nullptr;
+	if (SUCCEEDED(s_webview->QueryInterface(kIID_ICoreWebView2_7, reinterpret_cast<void **>(&webview7))) &&
+		webview7 != nullptr) {
+		PrintToPdfHandler *handler = new PrintToPdfHandler();
+		webview7->PrintToPdf(path.c_str(), print, handler);
+		handler->Release();
+		webview7->Release();
+	} else {
+		MsgBoxWarn(MB_OK, IDS_MDPREVIEW_PDF_FAILED);
+	}
+	print->Release();
+}
+
+} // namespace
+
+void MDPreview_ExportPdf(HWND hwnd) noexcept {
+	if (s_webview == nullptr) {
+		MsgBoxWarn(MB_OK, IDS_MDPREVIEW_UNAVAILABLE);
+		return;
+	}
+
+	WCHAR szFile[MAX_PATH];
+	if (StrNotEmpty(szCurFile)) {
+		lstrcpyn(szFile, szCurFile, COUNTOF(szFile));
+		::PathRenameExtensionW(szFile, L".pdf");
+	} else {
+		lstrcpy(szFile, L"Markdown.pdf");
+	}
+
+	WCHAR szFilter[256];
+	GetString(IDS_MDPREVIEW_PDF_FILTER, szFilter, COUNTOF(szFilter));
+	for (LPWSTR p = szFilter; *p != L'\0'; ++p) {
+		if (*p == L'|') {
+			*p = L'\0';
+		}
+	}
+
+	OPENFILENAMEW ofn;
+	ZeroMemory(&ofn, sizeof(ofn));
+	ofn.lStructSize = sizeof(ofn);
+	ofn.hwndOwner = hwnd;
+	ofn.lpstrFilter = szFilter;
+	ofn.lpstrFile = szFile;
+	ofn.nMaxFile = COUNTOF(szFile);
+	ofn.lpstrDefExt = L"pdf";
+	ofn.Flags = OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY;
+	if (!::GetSaveFileNameW(&ofn)) {
+		return;
+	}
+
+	s_pdfTargetPath = szFile;
+	if (s_pageAlive && !s_renderBusy) {
+		s_printOnNavComplete = false;
+		DoPrintToPdf();
+	} else {
+		// re-render the current buffer first; the PDF is written on NavigationCompleted
+		s_printOnNavComplete = true;
+		if (!s_renderBusy) {
+			s_renderBusy = true;
+			if (s_pageAlive) {
+				s_webview->ExecuteScript(L"window.scrollY|0", new ScrollCaptureHandler());
+			} else {
+				RenderNow();
+			}
+		}
+	}
+}
 
 //=============================================================================
 // Public API.

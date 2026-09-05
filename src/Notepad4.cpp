@@ -2142,10 +2142,9 @@ void MsgSize(HWND hwnd, WPARAM wParam, LPARAM lParam) noexcept {
 
 	// the preview pane and the editor share the same client area, only the
 	// visible one is laid out; switching re-runs WM_SIZE so both get fresh bounds
-	HWND hwndContent = bMDPreview ? MDPreview_GetHostWindow() : hwndEdit;
-	if (hwndContent != nullptr) {
-		SetWindowPos(hwndContent, nullptr, x, y, cx, cy, SWP_NOZORDER | SWP_NOACTIVATE);
-	}
+	HWND hwndContent = (bMDPreview && MDPreview_GetHostWindow() != nullptr)
+		? MDPreview_GetHostWindow() : hwndEdit;
+	SetWindowPos(hwndContent, nullptr, x, y, cx, cy, SWP_NOZORDER | SWP_NOACTIVATE);
 
 	// resize Statusbar items
 	UpdateStatusbar();
@@ -4160,6 +4159,10 @@ LRESULT MsgCommand(HWND hwnd, WPARAM wParam, LPARAM lParam) {
 		break;
 
 	case IDT_VIEW_MDPREVIEW:
+		if (MDPreview_GetHostWindow() == nullptr) {
+			MsgBoxWarn(MB_OK, IDS_MDPREVIEW_UNAVAILABLE);
+			break;
+		}
 		bMDPreview = !bMDPreview;
 		// the two panes share the same client area; hide the inactive one
 		// (the editor was created first and would otherwise stay on top)
@@ -4175,6 +4178,14 @@ LRESULT MsgCommand(HWND hwnd, WPARAM wParam, LPARAM lParam) {
 			SendMessage(hwnd, WM_SIZE, SIZE_RESTORED, MAKELPARAM(rc.right, rc.bottom));
 		}
 		UpdateToolbar();
+		break;
+
+	case IDM_VIEW_MDPREVIEW_SET:
+		MDPreview_SettingsDialog(hwnd);
+		break;
+
+	case IDM_FILE_EXPORT_PDF:
+		MDPreview_ExportPdf(hwnd);
 		break;
 
 	case IDM_VIEW_MINTOTRAY:
@@ -5393,6 +5404,9 @@ void LoadSettings() noexcept {
 
 	// Scintilla Styles
 	Style_Load();
+
+	// Markdown preview appearance
+	MDPreview_LoadSettings();
 }
 
 void SaveSettingsNow(bool bOnlySaveStyle, bool bQuiet) noexcept {
@@ -5581,6 +5595,8 @@ void SaveSettings(bool bSaveSettingsNow) noexcept {
 	NP2HeapFree(pIniSectionBuf);
 	// Scintilla Styles
 	Style_Save();
+	// Markdown preview appearance
+	MDPreview_SaveSettings();
 }
 
 void SaveWindowPosition(WCHAR *pIniSectionBuf) noexcept{

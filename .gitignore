@@ -32,3 +32,9 @@ compile_commands.json
 *.plist
 *.orig
 *.log
+
+# locale resource DLL build artifacts
+locale/*/Notepad4.dll
+locale/*/Notepad4.res
+locale/*/matepath.dll
+locale/*/matepath.res
